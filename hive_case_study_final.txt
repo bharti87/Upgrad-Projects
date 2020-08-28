@@ -1,0 +1,740 @@
+-- ***********************************************************************************************************************
+--               Data Ingestion and Processing - Hive Case Study
+-- ***********************************************************************************************************************
+
+-- The New York City Taxi & Limousine Commission (TLC) has provided a dataset of trips made by the taxis in the New York City. 
+-- The detailed trip-level data is more than just a vast list of taxi pickup and drop off coordinates.  
+
+-- The purpose of this dataset is to get a better understanding of the taxi system so that the city of New York can improve the efficiency 
+-- of in-city commutes. Several exploratory questions can be asked about the travelling experience for passengers.
+
+-- In this assignment, we ONLY consider the data of yellow taxis for November and December of the year 2017.
+
+-- The dataset has been placed in the HDFS storage of the lab. The path to the data files is as follows: '/common_folder/nyc_taxi_data/'
+
+--  The whole case study is manily divided in to three parts
+-- 1. Basic data quality check
+-- 2. Analysis part I
+-- 3. Analysis part II
+
+--Adding JAR files
+
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+-- Pre-requisite for creating partitioned tables
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+-- Creating database schema and using the same for further operations on a dataset
+Create database if not exists  br_taxi_assignment;
+use  br_taxi_assignment;
+
+-- As the NYC Taxi Data is stored in common folder '/common_folder/nyc_taxi_data/', we will create a new external table in personal DB.
+
+drop table nyc_yellow_taxi; 
+
+create external table if not exists nyc_yellow_taxi ( 
+        vendorid int ,
+        tpep_pickup_datetime timestamp,
+        tpep_dropoff_datetime timestamp,
+        passenger_count int,
+        trip_distance double,
+        ratecodeid int,
+        store_and_fwd_flag string ,
+        pulocationid int,
+        dolocationid int,
+        payment_type int,
+        fare_amount double,
+        extra double,
+        mta_tax double,     
+        tip_amount double,
+        tolls_amount double,
+        improvement_surcharge double,
+        total_amount double ) ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+location '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="1");
+
+-- Query to check first 10 rows in data file
+select * from nyc_yellow_taxi limit 10;
+
+-- ************************************************************************************************************
+--                  1. Basic Data Quality Check 
+-- ************************************************************************************************************
+
+-- Total number of records provided 
+select count(*) from nyc_yellow_taxi;
+-- Total Records -	1174569
+
+-- QUESTION - 1
+--__________________________________
+-- Let us query the records under each TPEP provider. Total Records each TPEP provider has provided
+
+SELECT Count(*) AS Tot_Records, 
+       vendorid AS TPEP_Provider 
+FROM   nyc_yellow_taxi 
+GROUP  BY vendorid; 
+
+-- Tot-Records      TPEP_provider
+-- 647183	        2 -  VeriFone Inc.
+-- 527386	        1 -  Creative Mobile Technologies, LLC
+
+-- QUESTION - 2
+-- ____________________________________
+-- The data provided is for months November and December only. 
+-- Check whether the data is consistent, and if not, identify the data quality issues. 
+
+select distinct(month(tpep_pickup_datetime)) as driving_month from nyc_yellow_taxi;
+
+-- So there are months ohter than 11,12 in the data
+-- 10 , 12, 1, 11
+
+-- Since for this assignment, we are only considering data for month Nov(11) and Dec(12) for year 2017, 
+-- we will later remove the records which are from months other than these two in our data cleaning part
+
+select distinct(year(tpep_pickup_datetime)) as driving_year from nyc_yellow_taxi ;
+
+-- So, there are also other years present in the data except 2017
+-- 2008, 2018, 2003, 2009, 2017
+
+SELECT Count(*) 
+FROM   nyc_yellow_taxi 
+WHERE  Month(tpep_pickup_datetime) NOT IN ( 11, 12 ) 
+        OR Year(tpep_pickup_datetime) != 2017; 
+        
+-- Total 14 records are having pickup month and year not equal to (November, December) and 2017 respectively.
+
+SELECT vendorid, 
+       Count(*) 
+FROM   nyc_yellow_taxi 
+WHERE  Month(tpep_pickup_datetime) NOT IN ( 11, 12 ) 
+        OR Year(tpep_pickup_datetime) != 2017 
+GROUP  BY vendorid; 
+
+-- All the 14 records belong to vendor id 2 
+
+-- Let us go ahead and do a usual data inconsistency check on the data by analyzing each column.
+
+-- 1. Checking tpep_pickup_datetime for NULL values
+
+select count(*) from nyc_yellow_taxi where tpep_pickup_datetime is null;
+-- No null value
+
+-- 2. Vendor ID: as per the data dictionary, there can only be 2 distinct values of Vendor ID(1 and 2), let us cross-check the same. 
+
+select distinct vendorid from nyc_yellow_taxi;
+--there are only 2 distict values of vendor ID i.e. 1 and 2.
+
+-- 3. Checking tpep_dropoff_datetime for NULL values
+
+select count(*) from nyc_yellow_taxi where tpep_dropoff_datetime is null;
+-- No Null value
+
+-- 4. pick up time and drop off time crosscheck for any discrepancies
+
+SELECT vendorid, 
+       Count(tpep_pickup_datetime) AS count_of_error_record 
+FROM   nyc_yellow_taxi 
+WHERE  tpep_pickup_datetime >= tpep_dropoff_datetime 
+GROUP  BY vendorid; 
+
+-- 2       3063    -- VeriFone Inc.
+-- 1       3492    -- Creative Mobile Technologies, LLC
+-- We can oberve that almost both the vendors have errorneous records having pick up time greater than drop off time
+-- We need to remove such data before moving on to further data analysis.
+
+-- 5. Passenger_count
+
+select passenger_count, count(*) from  nyc_yellow_taxi  group by passenger_count;
+
+-- Passenger_count    total_count
+-- 0                    6824
+-- 2                    176872
+-- 4                    24951
+-- 6                    33146
+-- 8                    3
+-- 1                    827499
+-- 3                    50693
+-- 5                    54568
+-- 7                    12
+-- 9                    1
+-- We can conclude that since taxis or limosuines can generally can accomodate people between 1 to 10 at once, we are gonna assume that 
+--maximum number of passangers being more than 10 or less than 1 is an issue.
+ -- -- 0 count seems like an error entry hence lets check which provider has send this details
+ 
+SELECT vendorid, 
+       passenger_count        AS error_record, 
+       Count(passenger_count) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  passenger_count NOT IN ( 1, 2, 3, 4, 
+                                5, 6, 7, 8, 
+                                9, 10 ) 
+GROUP  BY passenger_count, 
+          vendorid; 
+
+-- Vendor id error_record count_of_error_records 
+-- 2                0       11
+-- 1                0       6813
+-- We can oberve that Vendor id - 2 -  VeriFone Inc. has maximum records with passenger_count as 0.
+ 
+
+--6. Distance
+
+select  vendorid,count(*) from  nyc_yellow_taxi where trip_distance<=0 group by vendorid;
+
+-- Vendor id      count
+-- 2                3185
+-- 1                4217
+-- Both the vendors have records with trip distance less than 0 and we need to clean up this data before analysis.
+
+-- 7. PULocationID and DOLocationID check for null values
+
+select count(*) from nyc_yellow_taxi where PULocationID is null;
+select count(*) from nyc_yellow_taxi where DOLocationID is null;
+
+-- There are no null values present for these columns
+
+-- 8. let us now analyze RateCodeID, ideally there should be only 6 distinct values under this column
+
+SELECT vendorid, 
+       ratecodeid, 
+       Count(ratecodeid) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  ratecodeid NOT IN ( 1, 2, 3, 4, 
+                           5, 6 ) 
+GROUP  BY vendorid, 
+          ratecodeid; 
+
+-- Vendorid ratecodeid count
+--      1       99      8
+--      2       99      1
+--  We can see that ratecodeid 99 also exists and it is not a valid entry and need to be cleaned up
+
+
+-- 9. Store_and_fwd_flag, there can be only 2 distinct values under it.
+
+SELECT vendorid, 
+       store_and_fwd_flag        AS error_record, 
+       Count(store_and_fwd_flag) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  store_and_fwd_flag NOT IN ( 'Y', 'N' ) 
+GROUP  BY store_and_fwd_flag, 
+          vendorid; 
+ 
+ -- There are no results for the error entries for this column hence no issue with this column
+
+-- 10. Payment_type, there can be only 6 distinct values under it.
+
+SELECT vendorid, 
+       payment_type        AS error_record, 
+       Count(payment_type) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  payment_type NOT IN ( 1, 2, 3, 4, 
+                             5, 6 ) 
+GROUP  BY payment_type, 
+          vendorid; 
+          
+ -- There are no results for the error entries for this column hence no issue with this column
+
+-- 11 .Extra
+
+SELECT vendorid, 
+       extra        AS error_record, 
+       Count(extra) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  extra NOT IN ( 0.0, 0.5, 1.0 ) 
+GROUP  BY vendorid, 
+          extra; 
+          
+-- VendorID   Extra   Count of Extra
+--      2       -4.5    5
+--      2       -1.0    87
+--      2       -0.5    193
+--      2       0.3     36
+--      2       4.5     2683
+--      2       4.8     1
+--      1       -10.6   1
+--      1       1.5     2
+--      1       2.0     1
+--      1       4.5     1819
+--      2       0.8     15
+--      2       1.3     13
+
+-- As per the data dictionary, the extra_charge is a surcharge that can only take up $0.5 and $1 during rush hour and traffic, otherwise it is $0.
+-- Hence, there are error entries in the data with extra charge not being 0.5 and 1 and vendor ID = 2 has many such records. 
+-- all the error entries will be removed.
+
+select extra as Extra_Misc_Charge, count(*) as Num_Records
+from nyc_yellow_taxi
+group by extra
+order by extra;
+
+--Extra    count
+-- -10.6   1
+-- -4.5    5
+-- -1.0    87
+-- -0.5    193
+-- 0.0     631872
+-- 0.3     36
+-- 0.5     363455
+-- 0.8     15
+-- 1.0     174386
+-- 1.3     13
+-- 1.5     2
+-- 2.0     1
+-- 4.5     4502
+-- 4.8     1
+
+-- 12. MTA_tax
+
+SELECT vendorid, 
+       mta_tax        AS error_record, 
+       Count(mta_tax) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  mta_tax NOT IN ( 0.0, 0.5 ) 
+GROUP  BY vendorid, 
+          mta_tax; 
+
+-- vendorid MTA_tax count
+--  1       11.4    1
+--  2       -0.5    544
+--  2       0.0     2486
+--  2       3.0     3
+--  1       0.0     2711
+
+-- We can conclude from above resuls that there are errorneous records present in the data for both the vendors with vendor id 2 having  more error entries
+-- As per data dictionary only 0.0$ and 0.5$ are allowed values and hence other values will be counted as not required
+
+-- 13. Improvement_surcharge
+
+SELECT vendorid, 
+       improvement_surcharge        AS error_record, 
+       Count(improvement_surcharge) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  improvement_surcharge NOT IN ( 0.0, 0.3 ) 
+GROUP  BY vendorid, 
+          improvement_surcharge; 
+          
+-- vendorid improve_surchrg count
+--      2       -0.3        558
+--      2       1.0         4
+-- -The improvement_surcharge of $0.3 began being levied on trips in 2015 this means that the improvement_surcharge can only take up $0 or $0.3 
+-- Still from the bove results show that vendor id - 2 still has provided many error entries in the data related to MTA_tax
+
+-- 14. Tip_amount
+
+SELECT vendorid, 
+       tip_amount        AS error_record, 
+       Count(tip_amount) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  tip_amount < 0 
+GROUP  BY vendorid, 
+          tip_amount; 
+
+-- vendorid Tip amount count
+--      2       -1.16   1
+--      2       -0.86   1
+--      2       -0.82   1
+--      2       -0.66   1
+-- There are error entries related to tip_amount with the data provided by vendor id 2 alone. and tip amount shows less than 0 amount which should not be the case
+
+-- As per data dictionary cash tips are not included in this column
+-- Below query checks if cash tips are inluded for this column
+
+select tip_amount , count(*) as Tot_records
+from nyc_yellow_taxi
+where payment_type=2 and tip_amount!= 0
+group by tip_amount;
+
+-- No such rows present in the data which is good
+
+-- 15. Fare_amount
+
+SELECT vendorid, 
+       fare_amount        AS error_record, 
+       Count(fare_amount) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  fare_amount <= 0 
+GROUP  BY vendorid, 
+          fare_amount; 
+
+-- From the results we can summarize that vendor id 2 has most errorneous entries for fare amount shown as negative 
+-- hence such rows won't be considered for analysis
+
+
+-- 16. Tolls_amount
+
+SELECT vendorid, 
+       tolls_amount        AS error_record, 
+       Count(tolls_amount) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  tolls_amount < 0 
+GROUP  BY vendorid, 
+          tolls_amount; 
+
+-- vendorid tolls_amount count
+--  2       -5.76           3
+-- Again vendor id 2 has the error entries for toll amount being negative value which is invalid.
+
+-- 17. Total_amount
+
+SELECT vendorid, 
+       total_amount        AS error_record, 
+       Count(total_amount) AS count_of_error_records 
+FROM   nyc_yellow_taxi 
+WHERE  total_amount <= 0 
+GROUP  BY vendorid, 
+          total_amount; 
+
+-- From the results we can summarize that vendor id 2 has most errorneous entries for total amount shown as negative or 0
+-- hence such rows won't be considered for analysis
+
+-- QUESTION 3
+-- ____________________
+-- You might have encountered unusual or erroneous rows in the dataset. 
+-- Can you conclude which vendor is doing a bad job in providing the records?
+
+select vendorid as vendorid, 
+    case 
+    when VendorID=1 then 'Creative Mobile Technologies, LLC'
+    else 'VeriFone Inc.' end as Vendor_Name,
+    count(*) as Error_records
+from nyc_yellow_taxi 
+where (year(tpep_pickup_datetime) !=2017 or month(tpep_pickup_datetime) not in (11,12) 
+    or year(tpep_dropoff_datetime) !=2017 or month(tpep_dropoff_datetime) not in (11,12) 
+    or unix_timestamp(tpep_pickup_datetime) > unix_timestamp(tpep_dropoff_datetime) 
+    or passenger_count not in (1,2,3,4,5,6,7,8,9,10) 
+    or trip_distance <= 0.0 
+    or ratecodeid not in (1,2,3,4,5,6) 
+    or payment_type not in (1,2,3,4,5,6) 
+    or fare_amount <= 0 
+    or extra not in (0.0,0.5,1.0) 
+    or mta_tax not in(0.0,0.5) 
+    or tip_amount < 0.0 
+    or (payment_type=2 and tip_amount!=0) 
+    or tolls_amount < 0.0 
+    or improvement_surcharge not in (0.0,0.3) 
+    or total_amount <= 0)
+group by vendorid
+order by vendorid;
+
+-- Vendorid         Vendor name                     Count of error records
+--      1       Creative Mobile Technologies, LLC       12911
+--      2       VeriFone Inc.                           6414
+
+-- --Clearly from the above results, it is clear that of the two vendors, 
+-- VendorID 1: Creative Moblie Technologies,LLC is doing a bad job of providing records.
+
+
+***********************************************************************************************************************
+--   2. Analysis Part - I
+***********************************************************************************************************************
+
+-- let us now clean the data. we will create a new table without any discreipencies in columns and filetred data for Nov and Dec.
+
+-- dropping the orc partition table in case it exists
+drop table nyc_yellow_taxi_orc_partitioned;
+
+-- Creating an ORC partitioned  table by month and year partitions
+create external table if not exists nyc_yellow_taxi_orc_partitioned (
+        vendorid int,
+        tpep_pickup_datetime timestamp,
+        tpep_dropoff_datetime timestamp,
+        passenger_count int,
+        trip_distance double,
+        ratecodeid int,
+        store_and_fwd_flag string ,
+        pulocationid int,
+        dolocationid int,
+        payment_type int,
+        fare_amount double,
+        extra double,
+        mta_tax double,     
+        tip_amount double,
+        tolls_amount double,
+        improvement_surcharge double,
+        total_amount double ) partitioned by (yr int, mnth int)
+stored as orc location '/user/hive/warehouse/br_orc_data'
+tblproperties ("orc.compress"="SNAPPY");
+
+-- Writing the data from external table nyc_yellow_taxi to nyc_yellow_taxi_orc_partitioned by filtering out errorneous rows
+-- as analyzed previously in data consistency check
+
+insert overwrite table nyc_yellow_taxi_orc_partitioned partition(yr, mnth)
+select vendorid, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count, trip_distance,
+ratecodeid, store_and_fwd_flag, pulocationid, dolocationid, payment_type, fare_amount, extra, mta_tax, 
+tip_amount, tolls_amount, improvement_surcharge, total_amount,
+year(tpep_pickup_datetime) as yr, month(tpep_pickup_datetime) as mnth
+from nyc_yellow_taxi 
+where year(tpep_pickup_datetime)=2017 
+    and month(tpep_pickup_datetime) in (11,12) 
+    and year(tpep_dropoff_datetime)=2017 
+    and month(tpep_dropoff_datetime) in (11,12) 
+    and tpep_pickup_datetime < tpep_dropoff_datetime
+    and passenger_count in(1,2,3,4,5,6) 
+    and trip_distance > 0.0 
+    and ratecodeid in(1,2,3,4,5,6) 
+    and payment_type in (1,2,3,4,5,6) 
+    and fare_amount > 0.0 
+    and extra in (0.0,0.5,1.0) 
+    and mta_tax in(0.0,0.5) 
+    and tip_amount>=0.0 
+    and tolls_amount >= 0.0 
+    and improvement_surcharge in (0.0,0.3) 
+    and total_amount > 0;
+    
+    
+select count(*) from nyc_yellow_taxi_orc_partitioned;
+-- 1153495
+
+-- QUESTION 1
+--_______________________
+-- Compare the overall average fare per trip for November and December.
+
+SELECT mnth                      AS month_of_year, 
+       CASE 
+         WHEN mnth = 11 THEN 'November' 
+         ELSE 'December' 
+       END                       AS month_name, 
+       Round(Avg(fare_amount), 2)AS Average_Fare_Amount 
+FROM   nyc_yellow_taxi_orc_partitioned 
+GROUP  BY mnth 
+ORDER  BY mnth; 
+
+--November Average fare_amount: $12.91
+--December Average fare_amount: $12.7
+--Therefore the Average fare during November is higher than the average fare during December.
+
+-- QUESTION 2
+-- ____________________
+-- Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? 
+-- Do most people travel solo or with other people?
+
+SELECT passenger_count        AS number_of_passengers_per_trip, 
+       Count(passenger_count) AS count_of_number_of_passanger_per_trip 
+FROM   nyc_yellow_taxi_orc_partitioned 
+GROUP  BY passenger_count; 
+
+-- 	number_of_passengers_per_trip	count_of_number_of_passanger_per_trip
+--	        1	                                       816970
+--	        2	                                        174766
+--	        3	                                        50177
+--	        4	                                        24679
+--	        5	                                        54026
+--	        6	                                        32877
+
+--Let's compare if the passengers prefer to travel solo or in groups
+
+SELECT Sum(CASE 
+             WHEN passenger_count = 1 THEN 1 
+             ELSE 0 
+           END)AS Solo_Trips, 
+       Sum(CASE 
+             WHEN passenger_count != 1 THEN 1 
+             ELSE 0 
+           END)AS Group_Trips 
+FROM   nyc_yellow_taxi_orc_partitioned; 
+
+-- 	solo_trips	group_trips
+--	   816970	    336525
+
+--From the above results, we can conclude that count of people travelling solo is way higher than people travelling in groups. 
+-- Hence, yes most people travel solo.
+
+-- QUESTION 3
+-- _______________________________
+
+--Which is the most preferred mode of payment?
+
+SELECT CASE 
+         WHEN payment_type = 1 THEN 'Credit Card' 
+         WHEN payment_type = 2 THEN 'Cash' 
+         WHEN payment_type = 3 THEN 'No Charge' 
+         WHEN payment_type = 4 THEN 'Dispute' 
+         WHEN payment_type = 5 THEN 'Unknown' 
+         ELSE 'Voided trip' 
+       END                 AS Mode_of_Payment, 
+       Count(payment_type) AS count_of_mode_of_payment 
+FROM   nyc_yellow_taxi_orc_partitioned 
+GROUP  BY CASE 
+            WHEN payment_type = 1 THEN 'Credit Card' 
+            WHEN payment_type = 2 THEN 'Cash' 
+            WHEN payment_type = 3 THEN 'No Charge' 
+            WHEN payment_type = 4 THEN 'Dispute' 
+            WHEN payment_type = 5 THEN 'Unknown' 
+            ELSE 'Voided trip' 
+          END; 
+          
+-- 	mode_of_payment	count_of_mode_of_payment
+-- 1	Cash	        368611
+-- 2	Credit Card	    779093
+-- 3	Dispute	        1300
+-- 4	No Charge	    4491
+-- Therefore, the most preferred mode of payment for trips is Credit Card.
+
+
+-- QUESTION 4
+-- _________________________
+--What is the average tip paid per trip? Compare the average tip with the 25th, 50th and 75th percentiles and 
+--comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’. 
+
+SELECT Round(Avg(tip_amount), 2)                     AS Average_Tip_Amount, 
+       Round(Percentile_approx(tip_amount, 0.25), 2) AS 
+       25th_Percentile_Tip_Amount, 
+       Round(Percentile_approx(tip_amount, 0.5), 2)  AS 
+       50th_Percentile_Tip_Amount, 
+       Round(Percentile_approx(tip_amount, 0.75), 2) AS 
+       75th_Percentile_Tip_Amount 
+FROM   nyc_yellow_taxi_orc_partitioned; 
+
+-- 	average_tip_amount	| 25th_percentile_tip_amount|	50th_percentile_tip_amount|	75th_percentile_tip_amount
+---------------------------------------------------------------------------------------------------------------
+--	    1.83	        |        0	                |           1.35              |  	2.45
+
+-- As it is clear from results that Mean of the Tip Amount is little greater than the Median (50th Percentile).
+--Which means that data is positively skewed and there is significant skewness in the distribution of the tip_amount parameter. 
+-- it may be due to few records having higher tip_amount values. Therefore, in this situation Average_Tip is not representative of central tendency.
+
+-- QUESTION 5
+-- ___________________
+--Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+
+select extra, count(*) from nyc_yellow_taxi_orc_partitioned group by extra; 
+
+SELECT Count(*)                            AS Total_Trips, 
+       Round(Sum(CASE 
+                   WHEN extra != 0.0 THEN 1 
+                   ELSE 0 
+                 END) / Count(*), 5) * 100 AS Percentage_Trips_with_extra 
+FROM   nyc_yellow_taxi_orc_partitioned; 
+
+-- 	total_trips	| percentage_trips_with_extra
+--	1153495	    |       46.143
+
+-- Percentage of trips for which the Extra Charge was levied: 46.143%
+
+
+-- **************************************************************************************************************
+--              Analysis Part II:
+-- **************************************************************************************************************
+
+-- QUESTION 1
+-- ________________________
+--What is the correlation between the number of passengers on any given trip, and the tip paid per trip? 
+--Do multiple travellers tip more compared to solo travellers? 
+
+select round(corr(Passenger_count,Tip_amount),4)  from nyc_yellow_taxi_orc_partitioned;
+
+-- Since the correlation coefficient between passanger count and tip amount comes out to be -0.0053 which is quite negligible,
+--This proves that number of passangers doesnt affect tip amount.
+
+SELECT Round(Avg(CASE 
+                   WHEN passenger_count = 1 THEN tip_amount 
+                   ELSE NULL 
+                 END), 2) AS Solo_Average, 
+       Round(Avg(CASE 
+                   WHEN passenger_count != 1 THEN tip_amount 
+                   ELSE NULL 
+                 END), 2) AS Group_Average 
+FROM   nyc_yellow_taxi_orc_partitioned; 
+
+-- 	solo_average	group_average
+-- 	    1.3	           0.53
+
+-- As stated before that there is no correlation between passenger count and tip amount even the avergae tip for solo trips and group average trip shows the same
+-- Passenger count doesnt affect the tip amount rendered by the passenger per trip
+
+-- QUESTION 2
+-- ____________________________
+-- Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. 
+--Calculate the percentage share of each bucket (i.e. the fraction of trips falling in each bucket).
+
+select count(*) from nyc_yellow_taxi_orc_partitioned;
+
+SELECT a.tip_range, 
+       Concat(Round(( Count(*) * 100 / 1153495 ), 2), '%') AS tip_percent 
+FROM   (SELECT CASE 
+                 WHEN tip_amount >= 0 
+                      AND tip_amount < 5 THEN '[0-5)' 
+                 WHEN tip_amount >= 5 
+                      AND tip_amount < 10 THEN '[5-10)' 
+                 WHEN tip_amount >= 10 
+                      AND tip_amount < 15 THEN '[10-15)' 
+                 WHEN tip_amount >= 15 
+                      AND tip_amount < 20 THEN '[15-20)' 
+                 ELSE '>=20' 
+               END AS tip_range 
+        FROM   nyc_yellow_taxi_orc_partitioned) a 
+GROUP  BY a.tip_range 
+ORDER  BY a.tip_range ASC;    
+ 
+--  tip_range	tip_percent
+--	>=20	        0.09%
+--	[0-5)	        92.4%
+--  [10-15)	        1.68%
+--	[15-20)	        0.19%
+--	[5-10)	        5.64%
+ 
+-- The above results show that 0-5 bin has the most number of passengers giving the tip followed by 5-10 bin.
+ 
+
+-- QUESTION 3
+-- ________________________
+--Which month has a greater average ‘speed’ - November or December? Note that the variable ‘speed’ will have to be derived from other metrics
+
+SELECT CASE 
+         WHEN Month(tpep_dropoff_datetime) = 11 THEN 'Nov' 
+         ELSE 'Dec' 
+       END                                                                 AS 
+       Month, 
+       Round(Avg(trip_distance / ( ( Unix_timestamp(tpep_dropoff_datetime) - 
+                                           Unix_timestamp(tpep_pickup_datetime) 
+                                             ) 
+                                                             / 3600 )), 2) AS 
+       speed 
+FROM   nyc_yellow_taxi_orc_partitioned 
+GROUP  BY CASE 
+            WHEN Month(tpep_dropoff_datetime) = 11 THEN 'Nov' 
+            ELSE 'Dec' 
+          END; 
+    
+-- 	month	avg speed
+--	Dec	     11.07
+--	Nov	     10.97
+
+--The Average Speed of taxis in December is greater than their Average Speed in November.
+
+
+-- QUESTION 4
+-- _________________________________
+--Analyse the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) and 25th December (Christmas) 
+--and compare it with the overall average.  
+
+SELECT a.festival_day_or_not, 
+       Round(Avg(a.speed), 2) AS speed 
+FROM   (SELECT CASE 
+                 WHEN ( ( tpep_pickup_datetime >= '2017-12-25 00:00:00.0' 
+                          AND tpep_pickup_datetime < '2017-12-26 00:00:00.0' ) 
+                         OR ( tpep_pickup_datetime >= '2017-12-31 00:00:00.0' 
+                              AND tpep_pickup_datetime < '2018-01-01 00:00:00.0' 
+                            ) ) 
+                      THEN 
+                 'Festival_Day' 
+                 ELSE 'Non_Festival_day' 
+               END                                        AS Festival_day_or_not 
+               , 
+               trip_distance / ( ( 
+               Unix_timestamp(tpep_dropoff_datetime) - 
+               Unix_timestamp(tpep_pickup_datetime) 
+                                 ) 
+                                                 / 3600 ) AS speed 
+        FROM   nyc_yellow_taxi_orc_partitioned) a 
+GROUP  BY a.festival_day_or_not; 
+
+-- 	festival_day_or_not	    speed
+-- ****************************************************
+--	Festival_Day	        14.03
+--	Non_Festival_day	    10.95
+
+-- --The average speed on both Cristmas and New Year festival days is higher than the overall average speed.
